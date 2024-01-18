@@ -1,0 +1,170 @@
+import slicer
+import numpy as np
+import os
+
+# Parameters to change-------------------------------------------------------
+patientID = '1'
+path2saveResults = r'C:\Mubashara\Dataset_Working\Volumes_Folder'
+# --------------------------------------------------------------------------
+
+# ------------------------------------
+def loadVolume(path, name=None):
+    """
+    Loads a dcm volume in 3D Slicer
+    
+    :path: path to dcm files
+    :name: volume name
+    """
+    loadedNodeIDs = []
+    from DICOMLib import DICOMUtils
+    with DICOMUtils.TemporaryDICOMDatabase() as db:
+        DICOMUtils.importDicom(path, db)
+        patientUIDs = db.patients()
+        for patientUID in patientUIDs:
+            loadedNodeIDs.extend(DICOMUtils.loadPatientByUID(patientUID))
+	
+    #volumeName = loadedNodeIDs[0]
+    volumeNode = slicer.util.getNode(loadedNodeIDs[0])  #specify volume
+    if(not name==None):
+        volumeNode.SetName(name)
+ 
+    return volumeNode
+
+# ------------------------------------
+def resample(volumeNode, resolution=[0.754,0.754,2.0], name='resampled'):
+    
+    """
+    Automatization of Resample Scalar Volume in 3D Slicer. Interpolation is 
+    set as bspline in the code below. 
+    
+    :volumeNode: node of the reference images
+    :resolution: new spacing in all dimensions (x, y, z)
+    :name: new resliced volume name
+    
+    :return: new resliced volume node
+    """
+
+    resampledVolumeNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", name)
+    parameters = {
+        "outputPixelSpacing":"{:},{:},{:}".format(*resolution),
+        "InputVolume":volumeNode.GetID(),
+        "interpolationMode":'bspline',
+        "referenceVolume": volumeNode.GetID(),
+        "OutputVolume":resampledVolumeNode.GetID()}
+    
+    cliNode = slicer.cli.runSync(slicer.modules.resamplescalarvolume, None, parameters)
+    
+    if cliNode.GetStatus() & cliNode.ErrorsMask:
+        # error
+        errorText = cliNode.GetErrorText()
+        slicer.mrmlScene.RemoveNode(cliNode)
+        raise ValueError("CLI execution failed in reslice: " + errorText)
+
+    # success
+    slicer.mrmlScene.RemoveNode(cliNode)
+    
+    resampledVolumeNode.GetDisplayNode().SetAutoWindowLevel(0)
+    resampledVolumeNode.GetDisplayNode().SetWindowLevel(400,40)
+    
+    return resampledVolumeNode
+    
+# ------------------------------------
+def cropVolumeUsingResampleScalarVector(volumeNode, referenceVolumeNode, name='kctResampledCropped', 
+        transformNode = None, interpolationType = 'linear'):
+
+    resampledCroppedVolumeNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", name)
+    
+    # outputVectorNode = slicer.mrmlScene.AddNewNodeByClass(“vtkMRMLVectorVolumeNode”)
+    #outputVectorNode.SetName(‘disp_PIPER_skinskel_afterDemons_afterresample’)
+
+    parameters = {}
+    parameters['inputVolume'] = volumeNode
+    #Set output as vector volume
+    parameters['outputVolume'] = resampledCroppedVolumeNode
+    parameters['referenceVolume'] = referenceVolumeNode
+    if (not transformNode is None):
+        parameters['transformationFile'] = transformNode
+    parameters['interpolationType'] = interpolationType
+
+    cliNode = slicer.cli.runSync(slicer.modules.resamplescalarvectordwivolume,None,parameters)
+
+    # slicer.util.saveNode(outputVectorNode, outputDisplacementfield_resampled,{“useCompression”: 0})
+    
+    return resampledCroppedVolumeNode
+# ------------------------------------    
+    
+# Script------------------------------------------------------------------------------------------------------------
+# Load kct volume 
+print('Loading kct volume')
+# Update slicer gui
+slicer.app.processEvents()
+kctVolumeNode = loadVolume(fr'C:\Mubashara\Dataset_Working\Updated_Dataset\{patientID}\scans\CT-SIM', name='kct')
+
+# Load mct volume 
+print('Loading mct volume')
+# Update slicer gui
+slicer.app.processEvents()
+mctVolumeNode = loadVolume(fr'C:\Mubashara\Dataset_Working\Updated_Dataset\{patientID}\scans\xMVCT', name='mct')
+
+
+# Resample kct volume so kct and mct have the same resolution
+print('Resampling kct volume')
+# Update slicer gui
+slicer.app.processEvents()
+
+mctSpacing = list(mctVolumeNode.GetSpacing())
+if(not (mctSpacing == [0.754, 0.754, 2.0])):
+    print('Warning. Resolution is: ' + str(mctSpacing))
+    
+kctResampledVolumeNode = resample(kctVolumeNode, resolution=mctSpacing, name='kctResampled')
+
+
+# Crop kct resampled volume
+print('Cropping kct volume')
+# Update slicer gui
+slicer.app.processEvents()
+
+kctResampledCroppedVolumeNode = cropVolumeUsingResampleScalarVector(kctResampledVolumeNode, mctVolumeNode, name='kctResampledCropped', 
+        transformNode = None, interpolationType = 'linear')
+
+
+
+# Apply Elastix for alignment 
+print('Aligning kctResampledCropped and mct volumes')
+# Update slicer gui
+slicer.app.processEvents()
+
+# Input volumes
+slicer.modules.elastix.widgetRepresentation().self().ui.fixedVolumeSelector.setCurrentNode(kctResampledCroppedVolumeNode)
+slicer.modules.elastix.widgetRepresentation().self().ui.movingVolumeSelector.setCurrentNode(mctVolumeNode)
+
+# Output volume
+mctAlignedVolumeNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", 'mctAligned')
+slicer.modules.elastix.widgetRepresentation().self().ui.outputVolumeSelector.setCurrentNode(mctAlignedVolumeNode)
+# Output transform 
+transformElastixNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLTransformNode", 'transformElastix') #slicer.vtkMRMLTransformNode()
+slicer.modules.elastix.widgetRepresentation().self().ui.outputTransformSelector.setCurrentNode(transformElastixNode)
+
+# Apply
+slicer.modules.elastix.widgetRepresentation().self().ui.applyButton.click()
+
+# Save kct and mct matrices in .npy format
+kctResampledCroppedArray = slicer.util.arrayFromVolume(kctResampledCroppedVolumeNode) # shape is (nSlices, 512, 512)
+mctAlignedArray = slicer.util.arrayFromVolume(mctAlignedVolumeNode)
+
+# Create patient folder
+if not os.path.exists(os.path.join(path2saveResults, 'imgs', patientID)): 
+    os.makedirs(os.path.join(path2saveResults, 'imgs', patientID)) 
+if not os.path.exists(os.path.join(path2saveResults, 'labels', patientID)): 
+    os.makedirs(os.path.join(path2saveResults, 'labels', patientID)) 
+
+print('Saving imgs at ' + os.path.join(path2saveResults, 'imgs', patientID))
+print('Saving labels at ' + os.path.join(path2saveResults, 'labels', patientID))
+# Update slicer gui
+slicer.app.processEvents()
+
+for nSlice in range(kctResampledCroppedArray.shape[0]):
+    np.save(os.path.join(path2saveResults, 'imgs', patientID, str(nSlice) + '.npy'), kctResampledCroppedArray[nSlice])
+    np.save(os.path.join(path2saveResults, 'labels', patientID,  str(nSlice) + '.npy'), mctAlignedArray[nSlice])
+    
+print('Process completed :)')
